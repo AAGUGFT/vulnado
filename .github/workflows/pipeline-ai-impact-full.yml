@@ -1,0 +1,354 @@
+name: AI Impact Full Pipeline
+
+on:
+  workflow_dispatch:
+  #pull_request:
+  #  types: [opened, synchronize]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  repository-projects: write
+
+jobs:
+  generate_tests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate with Keycloak
+        id: keycloak_auth
+        run: |
+          TOKEN_RESPONSE=$(curl -s -X POST 'http://auth.gftaiimpact.local/realms/ai-impact/protocol/openid-connect/token' \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'client_id=ai-impact-client' \
+            -d "username=administrator" \
+            -d "password=Gft@2025" \
+            -d "scope=openid" \
+            -d "grant_type=password")
+
+          ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.access_token')
+
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+            echo "Failed to obtain access token"
+            echo "$TOKEN_RESPONSE"
+            exit 1
+          fi
+
+          echo "access_token=$ACCESS_TOKEN" >> $GITHUB_ENV
+
+      - name: Checkout the branch
+        run: |
+          BRANCH_NAME=${{ github.event.pull_request.head.ref }}
+          git fetch origin $BRANCH_NAME:$BRANCH_NAME
+          git checkout $BRANCH_NAME
+
+      - name: Create Classes List
+        id: changes
+          # java_files=$(find "src/main/java/com/scalesec/vulnado" -type f -name "*.java")
+          # while IFS= read -r FILE; do
+          #   echo "Processing file: $FILE"
+          #   JAVA_FILES+=(${FILE})
+          # done <<< "${java_files}"
+          # echo "JAVA_Files: ${JAVA_FILES}"
+          # {
+          #   echo "java_files<<EOF"
+          #   echo "$JAVA_FILES"
+          #   echo "EOF"
+          # } >> "$GITHUB_ENV"
+        run: |
+          java_files=$(find "src/main/java/com/scalesec/vulnado" -type f -name "*.java")          
+          JAVA_FILES=()
+          
+          while IFS= read -r FILE; do
+            echo "Processing file: $FILE"
+            JAVA_FILES+=("$FILE")
+          done <<< "$java_files"
+          
+          echo "JAVA_FILES: ${JAVA_FILES[@]}"
+          {
+            echo "java_files<<EOF"
+            printf "%s\n" "${JAVA_FILES[@]}"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare and Send to API (TestCreator)
+        id: send_api
+        run: |
+          FILES_ARRAY=()
+          while IFS= read -r FILE; do
+            CLASS_NAME=$(basename "$FILE" .java)
+            TEST_FILE="src/test/java/com/scalesec/vulnado/${CLASS_NAME}Tests.java"
+            FILES_ARRAY+=(--form "files=@${FILE}")
+            if [ -f "$TEST_FILE" ]; then
+              FILES_ARRAY+=(--form "ExistingTests=@${TEST_FILE}")
+            fi
+          done <<< "${{ env.java_files }}"
+
+
+          RESPONSE=$(curl --location 'http://api.gftaiimpact.local/ai/test' \
+            --header "Authorization: Bearer ${{ env.access_token }}" \
+            --form "RunName=GenerateTests" \
+            "${FILES_ARRAY[@]}" \
+            --form "jobName=DemoTestCreator" \
+            --form "SearchPattern=*.java" \
+            --form "TargetExtension=java" \
+            --form "PromptId=TestCreator__CreateUnitTests_V1" \
+            --form "SourceCodeLanguage=Java" \
+            --form "TestType=Unit" \
+            --form "TestingFrameworks=MSTEST,MOQ" \
+            --form "Llm=${{ vars.LLM }}" \
+            --form "AdditionalInstructions=Generate only the source code, without any extra information")
+          echo "API Response: $RESPONSE"
+          JOB_ID=$(echo $RESPONSE)
+          echo "job_id=$JOB_ID" >> $GITHUB_ENV
+
+      - name: Monitor Job Status
+        id: monitor_status
+        run: |
+          JOB_ID=${{ env.job_id }}
+          STATUS="Pending"
+          while [[ "$STATUS" != "Completed" ]]; do
+            RESPONSE=$(curl --location "http://api.gftaiimpact.local/ai/jobs/$JOB_ID/status" \
+              --header "Authorization: Bearer ${{ env.access_token }}")
+            STATUS=$(echo $RESPONSE | jq -r '.status')
+            echo "Current status: $STATUS"
+            sleep 10
+          done
+          echo "Final status: $STATUS"
+          OUTPUT_URIS=$(echo "$RESPONSE" | jq -r '.results[].output[].uri')
+
+          echo "job_response=$RESPONSE" >> "$GITHUB_ENV"
+
+          {
+            echo "output_uris<<EOF"
+            echo "$OUTPUT_URIS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Save Generated Tests
+        run: |
+          OUTPUT_URIS="${{ env.output_uris }}"
+
+          while IFS= read -r uri; do
+            FILE_URL="http://api.gftaiimpact.local${uri}" 
+            FILE_CONTENT=$(curl --location "$FILE_URL" --header "Authorization: Bearer ${{ env.access_token }}")
+            CLASS_NAME=$(basename "$uri" .java)
+            TEST_FILE="src/test/java/com/scalesec/vulnado/${CLASS_NAME}Tests.java"
+          
+            mkdir -p "$(dirname "$TEST_FILE")"
+            echo "$FILE_CONTENT" > "$TEST_FILE"
+          done <<< "$OUTPUT_URIS"
+
+
+#      - name: Add Comment to Issue
+#        run: |
+#          COMMENT="Unit Tests generated and included in branch"
+#          ISSUE_NUMBER=${{ github.event.pull_request.number }}
+#          REPO=${{ github.repository }}
+#          curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+#               -H "Accept: application/vnd.github.v3+json" \
+#               -d "{\"body\": \"${COMMENT}\"}" \
+#               https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments
+
+      - name: Prepare and Send to API (DocCreator)
+        id: send_api2
+        run: |
+
+          FILES_ARRAY=()
+          while IFS= read -r FILE; do
+            CLASS_NAME=$(basename "$FILE" .java)
+            FILES_ARRAY+=(--form "files=@${FILE}")
+          done <<< "${{ env.java_files }}"
+
+          RESPONSE=$(curl --location 'http://api.gftaiimpact.local/ai/document' \
+            --header "Authorization: Bearer ${{ env.access_token }}" \
+            --form "RunName=GenerateDocPR" \
+            "${FILES_ARRAY[@]}" \
+            --form "jobName=DemoDocCreator" \
+            --form "DocumentationFormat=markdown" \
+            --form "DiagramFormat=Mermaid" \
+            --form "SourceCodeLanguage=Java" \
+            --form "DocumentationAudience=Developer" \
+            --form "PromptId=DocCreator__DocumentCode_V3" \
+            --form "TargetExtension=md" \
+            --form "Llm=${{ vars.LLM }}" \
+            --form "AdditionalInstructions=Generate all answers in ${{ vars.LANGUAGE }} and If the code have vulnerabilities, describe all in a new # vulnerabilities section")           
+          echo "API Response: $RESPONSE"
+          JOB_ID=$(echo $RESPONSE)
+          echo "job_id=$JOB_ID" >> $GITHUB_ENV
+
+      - name: Monitor Job Status
+        id: monitor_status2
+        run: |
+          JOB_ID=${{ env.job_id }}
+          STATUS="Pending"
+          while [[ "$STATUS" != "Completed" ]]; do
+            RESPONSE=$(curl --location "http://api.gftaiimpact.local/ai/jobs/$JOB_ID/status" \
+              --header "Authorization: Bearer ${{ env.access_token }}")
+            STATUS=$(echo $RESPONSE | jq -r '.status')
+            echo "Current status: $STATUS"
+            sleep 10
+          done
+          echo "Final status: $STATUS"
+          OUTPUT_URIS=$(echo "$RESPONSE" | jq -r '.results[].output[].uri')
+
+          echo "job_response=$RESPONSE" >> "$GITHUB_ENV"
+
+          {
+            echo "output_uris<<EOF"
+            echo "$OUTPUT_URIS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Save Generated Docs
+        run: |
+
+          OUTPUT_URIS="${{ env.output_uris }}"
+
+          while IFS= read -r uri; do
+            FILE_URL="http://api.gftaiimpact.local${uri}" 
+            FILE_CONTENT=$(curl --location "$FILE_URL" --header "Authorization: Bearer ${{ env.access_token }}")
+            CLASS_NAME=$(basename "$uri" | sed 's/\.java\.md$//')
+            DOC_FILE="wiki/src/main/java/com/scalesec/vulnado/${CLASS_NAME}Docs.md"
+          
+            mkdir -p "$(dirname "$DOC_FILE")"
+            echo "$FILE_CONTENT" > "$DOC_FILE"
+          done <<< "$OUTPUT_URIS"
+
+#      - name: Add Comment to Issue
+#        run: |
+#          COMMENT="Documents generated and included in the branch"
+#          ISSUE_NUMBER=${{ github.event.pull_request.number }}
+#          REPO=${{ github.repository }}
+#          curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+#               -H "Accept: application/vnd.github.v3+json" \
+#               -d "{\"body\": \"${COMMENT}\"}" \
+#               https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments
+
+      - name: Commit and Push Documenter and Tests
+        run: |
+          git config --global user.name 'gft-ai-impact[bot]'
+          git config --global user.email 'ai-impact[bot]@gft.com'
+          git add .
+          git commit -m "Add generated Documentations and Unit Tests"
+#          git push --set-upstream origin ${{ github.event.pull_request.head.ref }}
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: "AI Impact documentation and Unit Tests"
+          title: "Documentation and Unit Tests created by IA Impact"
+          body: "Pull request created by IA Impact CodeDocumenter and CodeTester."
+          branch: "tester-by-ai"
+          delete-branch: true
+          add-paths: |
+              ./**/*.java
+              ./**/*.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+          labels: "auto-generated, testes"
+          draft: false
+
+          #            --form 'PullRequestId="${{ github.event.pull_request.number }}"' \
+      - name: Prepare and Send for Code Review
+        id: send_code_review
+        run: |
+          echo "Repositório: ${{github.repository}}"
+          RESPONSE=$(curl --location 'http://api.gftaiimpact.local/ai/review' \
+            --header "Authorization: Bearer ${{ env.access_token }}" \
+            --form 'RunName="CodeReview"' \
+            --form 'jobName="DemoCodeReviewerGithub"' \
+            --form 'PromptId="CodeReviewer__CodeReviewer_V1_Conventions"' \
+            --form 'Llm="${{ vars.LLM }}"' \
+            --form 'PullRequestId="${{ steps.create-pr.outputs.pull-request-number }}"' \
+            --form 'RepoName="${{github.repository}}"' \
+            --form 'AdditionalInstructions=""' \
+            --form 'Conventions="Header,Description,Summary,Recomendations,VulnExplanation"') 
+          echo "API Response: $RESPONSE"
+          JOB_ID=$(echo $RESPONSE)
+          echo "job_id=$JOB_ID" >> $GITHUB_ENV
+
+      - name: Monitor Code Review Job Status
+        id: monitor_code_review_status
+        run: |
+          JOB_ID=${{ env.job_id }}
+          STATUS="Pending"
+          while [[ "$STATUS" != "Completed" ]]; do
+            RESPONSE=$(curl --location "http://api.gftaiimpact.local/ai/jobs/$JOB_ID/status" \
+              --header "Authorization: Bearer ${{ env.access_token }}")
+            STATUS=$(echo $RESPONSE | jq -r '.status')
+            echo "Current status: $STATUS"
+            sleep 10
+          done
+          echo "Final status: $STATUS"
+          OUTPUT_URIS=$(echo "$RESPONSE" | jq -r '.results[].output[].uri')
+
+          echo "job_response=$RESPONSE" >> "$GITHUB_ENV"
+
+          {
+            echo "output_uris<<EOF"
+            echo "$OUTPUT_URIS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare and Send for Code Fix
+        id: monitor_code_fix_status
+        run: |
+
+          RESPONSE=$(curl --location 'http://api.gftaiimpact.local/ai/fix' \
+            --header 'Authorization: Bearer ${{ env.access_token }}' \
+            --form 'RunName="CodeFixer"' \
+            --form 'SastName="Sonar_Cloud"' \
+            --form 'jobName="DemoCodeFixerGithub"' \
+            --form 'SourceCodeLanguage="Java"' \
+            --form 'PromptId="CodeFixer__FixCode_V3"' \
+            --form 'TargetExtension="java"' \
+            --form 'Llm="${{ vars.LLM }}"' \
+            --form 'SearchPattern="*.java"' \
+            --form 'JobPreProcessors[]="VCS-CLONE-REPO"' \
+            --form 'JobPreProcessors[]="READ-CODE-CONVENTIONS"' \
+            --form 'JobPreProcessors[]="VCS-CHECKOUT-REPO"' \
+            --form 'ItemContentPostProcessors[]="WRITE-CONTENT"' \
+            --form 'ItemContentPostProcessors[]="COPY-CONTENT"' \
+            --form 'ItemContentPostProcessors[]="VCS-PULL-REQUEST-FILE-REPO"' \
+            --form 'JobPostProcessors[]="VCS-COMMIT-PUSH-REPO"' \
+            --form 'JobPostProcessors[]="VCS-PULL-REQUEST-REPO"' \
+            --form 'IssueSeverities[]="BLOCKER"' \
+            --form 'IssueSeverities[]="CRITICAL"' \
+            --form 'IssueSeverities[]="MAJOR"' \
+            --form 'SastIssueTypes[]="BUG"' \
+            --form 'SastIssueTypes[]="VULNERABILITY"' \
+            --form 'SastIssueTypes[]="CODE_SMELL"' \
+            --form 'Vcs[0][Name]="Codefixer"' \
+            --form 'BranchName="codefixer"' \
+            --form 'BaseBranch="master"' \
+            --form 'RepoName="${{ github.repository }}"' \
+            --form 'CreatePullRequestPerFile="true"' )
+          echo "API Response: $RESPONSE"
+          JOB_ID=$(echo $RESPONSE)
+          echo "job_id=$JOB_ID" >> $GITHUB_ENV
+
+      - name: Monitor Fixer Job Status
+        id: monitor_status3
+        run: |
+          JOB_ID=${{ env.job_id }}
+          STATUS="Pending"
+          while [[ "$STATUS" != "Completed" ]]; do
+            RESPONSE=$(curl --location "http://api.gftaiimpact.local/ai/jobs/$JOB_ID/status" \
+              --header "Authorization: Bearer ${{ env.access_token }}")
+            STATUS=$(echo $RESPONSE | jq -r '.status')
+            echo "Current status: $STATUS"
+            sleep 10
+          done
+          echo "Final status: $STATUS"
+          OUTPUT_URIS=$(echo "$RESPONSE" | jq -r '.results[].output[].uri')
+
+          echo "job_response=$RESPONSE" >> "$GITHUB_ENV"
+
+          {
+            echo "output_uris<<EOF"
+            echo "$OUTPUT_URIS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
