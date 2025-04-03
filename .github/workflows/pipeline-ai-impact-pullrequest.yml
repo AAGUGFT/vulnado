@@ -45,6 +45,7 @@ jobs:
             --header "Authorization: Bearer ${{ env.access_token }}" \
             --form 'RunName="CodeFixer"' \
             --form 'PromptId="CodeReviewer__CodeReviewer_V1_Conventions"' \
+            --form 'jobName="DemoCodeFixerGithub"' \
             --form 'Llm="${{ vars.LLM }}"' \
             --form 'PullRequestId="${{ github.event.pull_request.number }}"' \
             --form 'RepoName="${{ github.repository }}"' \
