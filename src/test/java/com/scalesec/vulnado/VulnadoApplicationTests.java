@@ -11,7 +11,7 @@ public class VulnadoApplicationTests {
 
 	@Test
 	public void contextLoads() {
-	}
+        throw new UnsupportedOperationException("Method not implemented");
 
 }
 
