@@ -3,8 +3,11 @@ package com.scalesec.vulnado;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 
+  private Cowsay() {
 public class Cowsay {
+    throw new UnsupportedOperationException("Utility class");
   public static String run(String input) {
+  }
     ProcessBuilder processBuilder = new ProcessBuilder();
     String cmd = "/usr/games/cowsay '" + input + "'";
     System.out.println(cmd);
